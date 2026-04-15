@@ -1,30 +1,23 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
 app = FastAPI(title="Handelsregister API")
-
-class SearchRequest(BaseModel):
-    schlagwoerter: str
 
 @app.get("/")
 def health():
     return {"status": "ok"}
 
 @app.post("/search")
-def search(request: SearchRequest):
+def search(schlagwoerter: str):
     try:
         session = requests.Session()
         url = "https://www.handelsregister.de/rp_web/erweitertesuche.xhtml"
         
-        # Get initial page for session
         session.get(url)
         
-        # Search request
         data = {
-            "form:schlagwoerter": request.schlagwoerter,
+            "form:schlagwoerter": schlagwoerter,
             "form:schlagwortOptionen": "1",
             "form:btnSuche": "Suchen",
         }
@@ -34,7 +27,7 @@ def search(request: SearchRequest):
         
         results = []
         rows = soup.select("table.ergebnisListe tr")
-        for row in rows[1:]:  # Skip header
+        for row in rows[1:]:
             cols = row.find_all("td")
             if len(cols) >= 3:
                 results.append({
@@ -43,7 +36,7 @@ def search(request: SearchRequest):
                     "register": cols[3].get_text(strip=True) if len(cols) > 3 else ""
                 })
         
-        return {"query": request.schlagwoerter, "count": len(results), "results": results}
+        return {"query": schlagwoerter, "count": len(results), "results": results}
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
