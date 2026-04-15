@@ -1,36 +1,56 @@
 from fastapi import FastAPI, HTTPException, Query
-import requests
+import mechanize
 from bs4 import BeautifulSoup
 import logging
+import re
 
 logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Handelsregister API")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "de-DE,de;q=0.9",
-}
 
-# Laut bundesAPI Doku: einfacher POST an diese URL
-SEARCH_URL = "https://www.handelsregister.de/rp_web/erweitertesuche.xhtml"
-WELCOME_URL = "https://www.handelsregister.de/rp_web/erweitertesuche/welcome.xhtml"
+def create_browser() -> mechanize.Browser:
+    br = mechanize.Browser()
+    br.set_handle_robots(False)
+    br.set_handle_equiv(True)
+    br.set_handle_gzip(True)
+    br.set_handle_refresh(False)
+    br.set_handle_redirect(True)
+    br.set_handle_referer(True)
+    br.addheaders = [
+        ("User-Agent",
+         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+         "AppleWebKit/537.36 (KHTML, like Gecko) "
+         "Chrome/124.0.0.0 Safari/537.36"),
+        ("Accept-Language", "de-DE,de;q=0.9,en;q=0.8"),
+        ("Accept-Encoding", "gzip, deflate, br"),
+        ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+        ("Connection", "keep-alive"),
+    ]
+    return br
 
 
-def get_session_with_cookie() -> requests.Session:
-    """Session mit akzeptiertem Cookie erstellen."""
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    # Cookie direkt setzen statt Consent-Flow
-    session.cookies.set("cookieAccepted", "true", domain="www.handelsregister.de")
-    # Welcome-Seite aufrufen um JSESSIONID zu bekommen
-    session.get(WELCOME_URL, timeout=30, allow_redirects=True)
-    return session
+def parse_result(result):
+    """Parse eine Ergebnis-Zeile (wie bundesAPI)."""
+    cells = []
+    for cell in result.find_all("td"):
+        cells.append(cell.text.strip())
+
+    if len(cells) < 5:
+        return None
+
+    d = {}
+    d["court"] = cells[1]
+
+    reg_match = re.search(
+        r"(HRA|HRB|GnR|VR|PR)\s*\d+(\s+[A-Z])?(?!\w)", d["court"]
+    )
+    d["register_num"] = reg_match.group(0) if reg_match else None
+    d["name"] = cells[2]
+    d["state"] = cells[3]
+    d["status"] = cells[4].strip()
+
+    return d
 
 
 @app.get("/")
@@ -41,100 +61,86 @@ def health():
 @app.post("/search")
 def search(schlagwoerter: str = Query(...)):
     try:
-        session = get_session_with_cookie()
+        br = create_browser()
 
-        # Laut bundesAPI Doku: einfache Parameter, KEIN "form:" Prefix
-        post_data = {
-            "schlagwoerter": schlagwoerter,
-            "schlagwortOptionen": 1,
-            "btnSuche": "Suchen",
-            "suchTyp": "e",
-            "ergebnisseProSeite": 100,
-        }
+        # Schritt 1: Startseite oeffnen
+        logger.info("Schritt 1: Startseite oeffnen")
+        br.open("https://www.handelsregister.de", timeout=30)
+        logger.info(f"  -> Titel: {br.title()}")
 
-        logger.info(f"POST {SEARCH_URL} mit schlagwoerter='{schlagwoerter}'")
-        resp = session.post(SEARCH_URL, data=post_data, timeout=30, allow_redirects=True)
-        logger.info(f"  -> status={resp.status_code}, length={len(resp.text)}, url={resp.url}")
-
-        if resp.status_code != 200:
-            snippet = resp.text[:300] if resp.text else "leer"
-            logger.error(f"  -> Fehler-Snippet: {snippet}")
-            return {
-                "query": schlagwoerter,
-                "count": 0,
-                "results": [],
-                "error": f"Status {resp.status_code}",
-                "debug_snippet": snippet,
-            }
-
-        soup = BeautifulSoup(resp.text, "lxml")
-        results = []
-
-        rows = (
-            soup.select("table.ergebnisListe tr")
-            or soup.select("table.resultList tr")
-            or soup.select("table tbody tr")
+        # Schritt 2: Zur erweiterten Suche navigieren
+        logger.info("Schritt 2: Navigiere zur erweiterten Suche")
+        br.select_form(name="naviForm")
+        br.form.new_control(
+            "hidden", "naviForm:erweiterteSucheLink",
+            {"value": "naviForm:erweiterteSucheLink"},
         )
+        br.form.new_control("hidden", "target", {"value": "erweiterteSucheLink"})
+        resp_search = br.submit()
+        logger.info(f"  -> Titel: {br.title()}")
 
-        for row in rows:
-            cols = row.find_all("td")
-            if len(cols) >= 3:
-                results.append({
-                    "firma": cols[1].get_text(strip=True) if len(cols) > 1 else "",
-                    "sitz": cols[2].get_text(strip=True) if len(cols) > 2 else "",
-                    "register": cols[3].get_text(strip=True) if len(cols) > 3 else "",
-                    "status": cols[4].get_text(strip=True) if len(cols) > 4 else "",
-                })
+        # Schritt 3: Suchformular ausfuellen und absenden
+        logger.info(f"Schritt 3: Suche nach '{schlagwoerter}'")
+        br.select_form(name="form")
+        br["form:schlagwoerter"] = schlagwoerter
+        br["form:schlagwortOptionen"] = ["1"]
+        resp_result = br.submit()
+        html = resp_result.read().decode("utf-8")
+        logger.info(f"  -> Titel: {br.title()}, HTML-Laenge: {len(html)}")
+
+        # Schritt 4: Ergebnisse parsen
+        soup = BeautifulSoup(html, "html.parser")
+        grid = soup.find("table", role="grid")
+
+        results = []
+        if grid:
+            for row in grid.find_all("tr"):
+                if row.get("data-ri") is not None:
+                    d = parse_result(row)
+                    if d:
+                        results.append(d)
 
         if not results:
-            page_text = soup.get_text(separator=" ", strip=True)[:500]
+            page_text = soup.get_text(separator=" ", strip=True)[:300]
             logger.info(f"Keine Treffer. Text: {page_text}")
-            return {
-                "query": schlagwoerter,
-                "count": 0,
-                "results": [],
-                "debug_snippet": page_text[:300],
-            }
 
-        return {"query": schlagwoerter, "count": len(results), "results": results}
+        return {
+            "query": schlagwoerter,
+            "count": len(results),
+            "results": results,
+        }
 
-    except requests.Timeout:
-        raise HTTPException(status_code=504, detail="Timeout")
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         logger.error(f"Fehler: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/debug")
-def debug_fetch():
-    """Zeigt was wir vom Handelsregister bekommen."""
+def debug():
+    """Debug: zeigt ob Navigation funktioniert."""
     try:
-        session = get_session_with_cookie()
-        logger.info(f"Cookies nach Welcome: {dict(session.cookies)}")
+        br = create_browser()
 
-        # Teste POST wie die bundesAPI Doku es beschreibt
-        post_data = {
-            "schlagwoerter": "Siemens",
-            "schlagwortOptionen": 1,
-            "btnSuche": "Suchen",
-            "suchTyp": "e",
-            "ergebnisseProSeite": 10,
-        }
-        resp = session.post(SEARCH_URL, data=post_data, timeout=30, allow_redirects=True)
+        br.open("https://www.handelsregister.de", timeout=30)
+        title1 = br.title()
+        forms1 = [f.name for f in br.forms()]
 
-        soup = BeautifulSoup(resp.text, "lxml")
-        tables = soup.find_all("table")
+        br.select_form(name="naviForm")
+        br.form.new_control(
+            "hidden", "naviForm:erweiterteSucheLink",
+            {"value": "naviForm:erweiterteSucheLink"},
+        )
+        br.form.new_control("hidden", "target", {"value": "erweiterteSucheLink"})
+        br.submit()
+        title2 = br.title()
+        forms2 = [f.name for f in br.forms()]
 
         return {
-            "cookies": dict(session.cookies),
-            "post_status": resp.status_code,
-            "post_final_url": str(resp.url),
-            "content_length": len(resp.text),
-            "tables_found": len(tables),
-            "page_title": soup.title.string.strip() if soup.title and soup.title.string else None,
-            "page_snippet": soup.get_text(separator=" ", strip=True)[:500],
+            "step1_title": title1,
+            "step1_forms": forms1,
+            "step2_title": title2,
+            "step2_forms": forms2,
+            "status": "ok",
         }
     except Exception as e:
         return {"error": str(e)}
