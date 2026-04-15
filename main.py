@@ -34,72 +34,91 @@ def extract_viewstate(soup: BeautifulSoup) -> str:
     return ""
 
 
-def accept_cookie_consent(session: requests.Session) -> bool:
+def resolve_form_action(action: str, page_url: str) -> str:
+    """Resolve form action relative to the page URL."""
+    if not action or action == "#" or action == "":
+        return page_url
+    if action.startswith("http"):
+        return action
+    if action.startswith("/"):
+        return "https://www.handelsregister.de" + action
+    # relative
+    base = page_url.rsplit("/", 1)[0]
+    return base + "/" + action
+
+
+def accept_cookie_consent(session: requests.Session) -> dict:
     """Lade Welcome-Seite und akzeptiere den Cookie-Consent."""
     logger.info("Schritt 1: GET Welcome-Seite")
     resp = session.get(WELCOME_URL, timeout=30, allow_redirects=True)
-    logger.info(f"  -> status={resp.status_code}, url={resp.url}")
+    page_url = str(resp.url)
+    logger.info(f"  -> status={resp.status_code}, url={page_url}")
 
     soup = BeautifulSoup(resp.text, "lxml")
-    viewstate = extract_viewstate(soup)
 
-    # Finde den "Verstanden"-Button / Consent-Form
-    # Typisch: ein Form mit einem Submit-Button "Verstanden"
-    consent_btn = soup.find("button", string=re.compile(r"Verstanden", re.I))
+    # Alle Forms und Buttons sammeln fuer Debug
+    all_forms = soup.find_all("form")
+    logger.info(f"  -> {len(all_forms)} Form(s) gefunden")
+
+    # Suche nach dem Consent-Button / Link
+    # Methode 1: Button mit "Verstanden"
+    consent_btn = None
+    for btn in soup.find_all(["button", "input", "a"]):
+        text = btn.get_text(strip=True) or btn.get("value", "")
+        if "verstanden" in text.lower():
+            consent_btn = btn
+            logger.info(f"  -> Consent-Element gefunden: <{btn.name}> text='{text}'")
+            break
+
     if not consent_btn:
-        consent_btn = soup.find("input", {"value": re.compile(r"Verstanden", re.I)})
-    if not consent_btn:
-        # Suche nach Link
-        consent_link = soup.find("a", string=re.compile(r"Verstanden", re.I))
-        if consent_link and consent_link.get("href"):
-            logger.info(f"  -> Consent-Link gefunden: {consent_link['href']}")
-            r2 = session.get(
-                "https://www.handelsregister.de" + consent_link["href"]
-                if consent_link["href"].startswith("/")
-                else consent_link["href"],
-                timeout=30,
-                allow_redirects=True,
-            )
-            logger.info(f"  -> Consent-Link status={r2.status_code}")
-            return r2.status_code == 200
+        logger.warning("Kein Verstanden-Button gefunden")
+        return {"ok": False, "reason": "no_button", "page_text": soup.get_text(separator=" ", strip=True)[:300]}
 
     # Finde das umgebende Form
-    form = soup.find("form")
+    form = consent_btn.find_parent("form")
     if not form:
-        logger.warning("Kein Form auf Welcome-Seite gefunden")
-        return False
+        form = all_forms[0] if all_forms else None
 
-    form_action = form.get("action", "")
-    if form_action and not form_action.startswith("http"):
-        form_action = "https://www.handelsregister.de" + form_action
+    if not form:
+        return {"ok": False, "reason": "no_form"}
 
-    # Alle hidden inputs sammeln
+    form_action = resolve_form_action(form.get("action", ""), page_url)
+    form_id = form.get("id", "")
+    logger.info(f"  -> Form id='{form_id}', action='{form_action}'")
+
+    # Alle hidden inputs + sonstige inputs sammeln
     form_data = {}
-    for inp in form.find_all("input", {"type": "hidden"}):
+    for inp in form.find_all("input"):
         name = inp.get("name")
         value = inp.get("value", "")
         if name:
             form_data[name] = value
 
-    # Button-Name finden
-    if consent_btn:
-        btn_name = consent_btn.get("name")
-        btn_value = consent_btn.get("value", "Verstanden")
-        if btn_name:
-            form_data[btn_name] = btn_value
+    # Button-spezifisch
+    btn_name = consent_btn.get("name")
+    btn_value = consent_btn.get("value", "")
+    if btn_name:
+        form_data[btn_name] = btn_value
 
-    # ViewState sicherstellen
-    if viewstate and "javax.faces.ViewState" not in form_data:
-        form_data["javax.faces.ViewState"] = viewstate
+    # Falls es ein <a> mit onclick / jsf.ajax ist
+    if consent_btn.name == "a":
+        onclick = consent_btn.get("onclick", "")
+        btn_id = consent_btn.get("id", "")
+        if btn_id:
+            form_data[btn_id] = btn_id
+        # JSF partial submit
+        if "mojarra" in onclick.lower() or "jsf" in onclick.lower() or "ajax" in onclick.lower():
+            form_data["javax.faces.partial.ajax"] = "true"
+            form_data["javax.faces.source"] = btn_id
+            form_data["javax.faces.partial.execute"] = "@all"
+            form_data["javax.faces.partial.render"] = "@all"
 
-    post_url = form_action or WELCOME_URL
-    logger.info(f"Schritt 2: POST Consent an {post_url}")
-    logger.info(f"  -> form_data keys: {list(form_data.keys())}")
+    logger.info(f"  -> POST form_data keys: {list(form_data.keys())}")
 
-    resp2 = session.post(post_url, data=form_data, timeout=30, allow_redirects=True)
-    logger.info(f"  -> status={resp2.status_code}, url={resp2.url}, length={len(resp2.text)}")
+    resp2 = session.post(form_action, data=form_data, timeout=30, allow_redirects=True)
+    logger.info(f"  -> Consent POST status={resp2.status_code}, url={resp2.url}, length={len(resp2.text)}")
 
-    return resp2.status_code == 200
+    return {"ok": resp2.status_code == 200, "status": resp2.status_code, "url": str(resp2.url)}
 
 
 @app.get("/")
@@ -113,32 +132,26 @@ def search(schlagwoerter: str = Query(...)):
         session = requests.Session()
         session.headers.update(HEADERS)
 
-        # ---- Cookie-Consent akzeptieren ----
-        consent_ok = accept_cookie_consent(session)
-        logger.info(f"Consent akzeptiert: {consent_ok}")
+        # ---- Cookie-Consent ----
+        consent = accept_cookie_consent(session)
+        logger.info(f"Consent-Ergebnis: {consent}")
 
-        # ---- Suchseite laden (ViewState holen) ----
+        # ---- Suchseite laden ----
         logger.info(f"Schritt 3: GET Suchseite {SEARCH_URL}")
         resp_form = session.get(SEARCH_URL, timeout=30, allow_redirects=True)
-        logger.info(
-            f"  -> status={resp_form.status_code}, "
-            f"url={resp_form.url}, length={len(resp_form.text)}"
-        )
+        logger.info(f"  -> status={resp_form.status_code}, url={resp_form.url}, length={len(resp_form.text)}")
 
+        # Falls 400 -> versuche Welcome-URL (evtl. Redirect nach Consent)
         if resp_form.status_code != 200:
-            # Fallback: vielleicht sind wir schon auf der Suchseite nach Consent
-            logger.info("Suchseite nicht 200 — versuche Welcome-URL als Fallback")
+            logger.info("Suchseite nicht 200 — versuche Welcome-URL")
             resp_form = session.get(WELCOME_URL, timeout=30, allow_redirects=True)
             logger.info(f"  -> Fallback status={resp_form.status_code}")
 
         soup_form = BeautifulSoup(resp_form.text, "lxml")
         viewstate = extract_viewstate(soup_form)
 
-        page_text = soup_form.get_text(separator=" ", strip=True)[:300]
-        logger.info(f"  -> ViewState: {'gefunden' if viewstate else 'NICHT GEFUNDEN'}")
-        logger.info(f"  -> Seitentext: {page_text[:200]}")
-
         if not viewstate:
+            page_text = soup_form.get_text(separator=" ", strip=True)[:300]
             return {
                 "query": schlagwoerter,
                 "count": 0,
@@ -147,13 +160,15 @@ def search(schlagwoerter: str = Query(...)):
                 "debug_snippet": page_text,
             }
 
-        # ---- Suche absenden ----
-        # Finde den form-Namen aus der Seite
+        # ---- Form-Daten aus der Seite extrahieren ----
         form_tag = soup_form.find("form")
         form_id = form_tag.get("id", "form") if form_tag else "form"
+        form_action = resolve_form_action(
+            form_tag.get("action", "") if form_tag else "",
+            str(resp_form.url),
+        )
 
         form_data = {}
-        # Alle hidden inputs
         if form_tag:
             for inp in form_tag.find_all("input", {"type": "hidden"}):
                 name = inp.get("name")
@@ -161,7 +176,6 @@ def search(schlagwoerter: str = Query(...)):
                 if name:
                     form_data[name] = value
 
-        # Suchparameter setzen
         form_data.update({
             form_id: form_id,
             f"{form_id}:schlagwoerter": schlagwoerter,
@@ -170,30 +184,14 @@ def search(schlagwoerter: str = Query(...)):
             "javax.faces.ViewState": viewstate,
         })
 
-        form_action = SEARCH_URL
-        if form_tag and form_tag.get("action"):
-            fa = form_tag["action"]
-            if fa.startswith("/"):
-                form_action = "https://www.handelsregister.de" + fa
-            elif fa.startswith("http"):
-                form_action = fa
-
         logger.info(f"Schritt 4: POST Suche an {form_action}")
-        resp_search = session.post(
-            form_action,
-            data=form_data,
-            timeout=30,
-            allow_redirects=True,
-        )
-        logger.info(
-            f"  -> status={resp_search.status_code}, length={len(resp_search.text)}"
-        )
+        resp_search = session.post(form_action, data=form_data, timeout=30, allow_redirects=True)
+        logger.info(f"  -> status={resp_search.status_code}, length={len(resp_search.text)}")
 
         # ---- Ergebnisse parsen ----
         soup_results = BeautifulSoup(resp_search.text, "lxml")
         results = []
 
-        # Verschiedene Selektoren
         rows = (
             soup_results.select("table.ergebnisListe tr")
             or soup_results.select("table.resultList tr")
@@ -216,11 +214,8 @@ def search(schlagwoerter: str = Query(...)):
             page_text = soup_results.get_text(separator=" ", strip=True)[:500]
             logger.info(f"Keine Treffer. Seitentext: {page_text}")
 
-            if any(
-                kw in page_text.lower()
-                for kw in ["keine treffer", "keine ergebnisse", "no results", "0 treffer"]
-            ):
-                info_msg = "Keine Treffer im Handelsregister fuer diese Suche."
+            if any(kw in page_text.lower() for kw in ["keine treffer", "keine ergebnisse", "0 treffer"]):
+                info_msg = "Keine Treffer im Handelsregister."
             else:
                 info_msg = "Ergebnisse konnten nicht geparst werden."
 
@@ -232,17 +227,13 @@ def search(schlagwoerter: str = Query(...)):
                 "debug_snippet": page_text[:300],
             }
 
-        return {
-            "query": schlagwoerter,
-            "count": len(results),
-            "results": results,
-        }
+        return {"query": schlagwoerter, "count": len(results), "results": results}
 
     except requests.Timeout:
         raise HTTPException(status_code=504, detail="Handelsregister Timeout")
     except requests.RequestException as e:
         logger.error(f"Request-Fehler: {e}")
-        raise HTTPException(status_code=502, detail=f"Handelsregister nicht erreichbar: {e}")
+        raise HTTPException(status_code=502, detail=f"Nicht erreichbar: {e}")
     except Exception as e:
         logger.error(f"Fehler: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -255,19 +246,23 @@ def debug_fetch():
         session = requests.Session()
         session.headers.update(HEADERS)
 
-        consent_ok = accept_cookie_consent(session)
+        consent = accept_cookie_consent(session)
 
         r = session.get(SEARCH_URL, timeout=30, allow_redirects=True)
         soup = BeautifulSoup(r.text, "lxml")
         vs = extract_viewstate(soup)
 
+        # Finde alle Forms + ihre IDs auf der Suchseite
+        forms = [{"id": f.get("id"), "action": f.get("action")} for f in soup.find_all("form")]
+
         return {
-            "consent_accepted": consent_ok,
+            "consent": consent,
             "search_status": r.status_code,
             "search_final_url": str(r.url),
             "viewstate_found": bool(vs),
             "cookies": dict(session.cookies),
-            "page_title": soup.title.string.strip() if soup.title else None,
+            "page_title": soup.title.string.strip() if soup.title and soup.title.string else None,
+            "forms_on_page": forms,
             "page_snippet": soup.get_text(separator=" ", strip=True)[:500],
         }
     except Exception as e:
