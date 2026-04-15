@@ -284,7 +284,7 @@ FIELD_CANDIDATES = {
     "schlagwoerter": ["form:schlagwoerter"],
     "schlagwortOptionen": ["form:schlagwortOptionen"],
     "ergebnisseProSeite": ["form:ergebnisseProSeite"],
-    "ort": ["form:ort", "form:niederlassung"],
+    "ort": ["form:ort"],
     "postleitzahl": ["form:postleitzahl", "form:plz"],
     "strasse": ["form:strasse"],
     "rechtsform": ["form:rechtsform"],
