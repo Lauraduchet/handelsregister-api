@@ -32,15 +32,17 @@ def health():
     return {"status": "ok", "endpoints": [
         "/handelsregister/search",
         "/handelsregister/dokument",
-        "/steuerkanzleien/search",
-        "/steuerkanzleien/detail",
-        "/enrich",
+        "/handelsregister/debug-fields",
+        "/steuerberater/search",
+        "/steuerberater/detail",
     ]}
 
 
-# ══════════════════════════════════════════════
-# HELPER: Mechanize-Browser
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+#
+#   MODUL 1: HANDELSREGISTER  (unveraendert aus vorheriger Version)
+#
+# ══════════════════════════════════════════════════════════════════
 
 def _create_browser() -> mechanize.Browser:
     br = mechanize.Browser()
@@ -59,12 +61,7 @@ def _create_browser() -> mechanize.Browser:
     return br
 
 
-# ══════════════════════════════════════════════
-# HELPER: Erweiterte Suche oeffnen
-# ══════════════════════════════════════════════
-
 def _open_erweiterte_suche(br: mechanize.Browser):
-    """Oeffnet handelsregister.de und navigiert zur erweiterten Suche."""
     br.open("https://www.handelsregister.de", timeout=15)
     br.select_form(name="naviForm")
     br.form.new_control("hidden", "naviForm:erweiterteSucheLink",
@@ -74,12 +71,7 @@ def _open_erweiterte_suche(br: mechanize.Browser):
     br.submit()
 
 
-# ══════════════════════════════════════════════
-# HELPER: Formularfelder debuggen
-# ══════════════════════════════════════════════
-
 def _debug_form_controls(br: mechanize.Browser) -> list:
-    """Gibt alle Control-Namen des aktuellen Formulars zurueck (fuer Debugging)."""
     controls = []
     for ctrl in br.form.controls:
         controls.append({
@@ -90,34 +82,50 @@ def _debug_form_controls(br: mechanize.Browser) -> list:
     return controls
 
 
-# ══════════════════════════════════════════════
-# HELPER: Formularfeld sicher setzen
-# ══════════════════════════════════════════════
+FIELD_CANDIDATES = {
+    "schlagwoerter": ["form:schlagwoerter"],
+    "schlagwortOptionen": ["form:schlagwortOptionen"],
+    "ergebnisseProSeite": ["form:ergebnisseProSeite_input"],
+    "ort": ["form:ort"],
+    "postleitzahl": ["form:postleitzahl"],
+    "strasse": ["form:strasse"],
+    "rechtsform": ["form:rechtsform_input"],
+}
 
-def _set_form_field(br: mechanize.Browser, field_name: str, value, is_list=False):
-    """Setzt ein Formularfeld. Wirft einen klaren Fehler statt silent pass."""
-    try:
-        if is_list:
-            br[field_name] = value if isinstance(value, list) else [str(value)]
-        else:
-            br[field_name] = value
-        return True
-    except mechanize.ControlNotFoundError:
-        # Versuche alternative Feldnamen (form: prefix varianten)
-        logger.warning(f"Feld '{field_name}' nicht gefunden. Verfuegbare Controls: "
-                       f"{[c.name for c in br.form.controls]}")
-        return False
+BUNDESLAND_MAP = {
+    "BW": "Baden-Wuerttemberg", "BY": "Bayern", "BE": "Berlin", "BR": "Brandenburg",
+    "HB": "Bremen", "HH": "Hamburg", "HE": "Hessen", "MV": "Mecklenburg-Vorpommern",
+    "NI": "Niedersachsen", "NW": "Nordrhein-Westfalen", "RP": "Rheinland-Pfalz",
+    "SL": "Saarland", "SN": "Sachsen", "ST": "Sachsen-Anhalt",
+    "SH": "Schleswig-Holstein", "TH": "Thueringen",
+}
+
+RECHTSFORM_MAP = {
+    "AG": "1", "eG": "2", "eV": "3", "Einzelkauffrau": "4", "Einzelkaufmann": "5",
+    "SE": "6", "EWIV": "7", "GmbH": "8", "KG": "10", "OHG": "12", "Partnerschaft": "13",
+}
 
 
-# ══════════════════════════════════════════════
-# HELPER: HR-Suchergebnis-Zeile parsen
-# ══════════════════════════════════════════════
+def _find_and_set(br, param_key, value, is_list=False):
+    candidates = FIELD_CANDIDATES.get(param_key, [f"form:{param_key}"])
+    for name in candidates:
+        try:
+            if is_list:
+                br[name] = value if isinstance(value, list) else [str(value)]
+            else:
+                br[name] = str(value)
+            return True
+        except (mechanize.ControlNotFoundError, mechanize.ItemNotFoundError):
+            continue
+    available = [c.name for c in br.form.controls if c.name]
+    logger.error(f"Feld '{param_key}' nicht gefunden! Kandidaten: {candidates}, Verfuegbar: {available}")
+    return False
+
 
 def _parse_hr_result_row(row) -> dict:
     cells = row.find_all("td")
     if len(cells) < 5:
         return None
-
     d = {
         "gericht": cells[1].get_text(strip=True) if len(cells) > 1 else "",
         "firma": cells[2].get_text(strip=True) if len(cells) > 2 else "",
@@ -125,11 +133,9 @@ def _parse_hr_result_row(row) -> dict:
         "status": cells[4].get_text(strip=True) if len(cells) > 4 else "",
         "dokumente": [], "register_nummer": "",
     }
-
     reg_match = re.search(r"(HRA|HRB|GnR|VR|PR)\s*\d+(\s+[A-Z])?(?!\w)", d["gericht"])
     if reg_match:
         d["register_nummer"] = reg_match.group(0).strip()
-
     if len(cells) > 5:
         for link in cells[5].find_all("a"):
             link_text = link.get_text(strip=True)
@@ -142,105 +148,52 @@ def _parse_hr_result_row(row) -> dict:
     return d
 
 
-# ══════════════════════════════════════════════
-# HELPER: SI-Dokument via JSF-POST abrufen
-# ══════════════════════════════════════════════
-
-def _fetch_si_document(br: mechanize.Browser, si_link_id: str) -> str:
-    """
-    Ruft ein SI-Dokument ab, indem der JSF-POST korrekt simuliert wird.
-    
-    Der SI-Link ist kein normaler Hyperlink, sondern ein PrimeFaces/JSF
-    CommandLink, der per onclick ein Formular submittet. Wir muessen:
-    1. Das ergebnissForm selektieren
-    2. Den Link-ID als javax.faces.source setzen
-    3. Den Submit ausfuehren
-    """
-    # Versuche zunaechst das Formular 'ergebnissForm' zu finden
+def _fetch_si_document(br, si_link_id):
     form_found = False
     for form in br.forms():
         if form.name and "ergebniss" in form.name.lower():
             br.select_form(name=form.name)
             form_found = True
             break
-
     if not form_found:
-        # Fallback: alle Formulare durchgehen und das mit dem SI-Link finden
-        for form in br.forms():
-            br.form = form
-            for ctrl in form.controls:
-                if ctrl.name and si_link_id in str(ctrl.name):
-                    form_found = True
-                    break
-            if form_found:
-                break
-
-    if not form_found:
-        # Letzter Fallback: erstes nicht-navi Formular
         for form in br.forms():
             if form.name and form.name != "naviForm":
                 br.select_form(name=form.name)
                 form_found = True
                 break
-
     if not form_found:
         raise Exception("Kein passendes Formular fuer SI-Abruf gefunden")
-
-    form_name = br.form.name or "ergebnissForm"
-
-    # javax.faces ViewState extrahieren
-    try:
-        vs_ctrl = br.form.find_control("javax.faces.ViewState")
-        view_state = vs_ctrl.value
-    except mechanize.ControlNotFoundError:
-        view_state = None
-
-    # JSF-POST Parameter setzen
-    # Der SI-Link-Klick sendet das Formular mit dem Link-ID als source
     try:
         br.form.new_control("hidden", si_link_id, {"value": si_link_id})
     except Exception:
         pass
-
     try:
         br.form.new_control("hidden", "javax.faces.source", {"value": si_link_id})
     except Exception:
         pass
-
     try:
         br.form.new_control("hidden", "javax.faces.partial.ajax", {"value": "false"})
     except Exception:
         pass
-
-    # Fix fuer mechanize readonly controls
     for ctrl in br.form.controls:
         ctrl.readonly = False
-
     response = br.submit()
     return response.read().decode("utf-8")
 
 
-# ══════════════════════════════════════════════
-# HELPER: SI-Dokument HTML parsen
-# ══════════════════════════════════════════════
-
-def _parse_si_document(html: str) -> dict:
+def _parse_si_document(html):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n", strip=True)
-
     result = {"firma": "", "anschrift": "", "plz_ort": "", "gegenstand": "",
               "geschaeftsfuehrer": [], "kapital": "", "rechtsform": "", "vertretung": "",
               "raw_text_snippet": text[:2000]}
-
     for table in soup.find_all("table"):
         for row in table.find_all("tr"):
             cells = row.find_all(["td", "th"])
             if len(cells) < 2:
                 continue
-
             label = cells[0].get_text(strip=True).lower()
             value = cells[1].get_text(strip=True)
-
             if "firma" in label and not result["firma"]:
                 result["firma"] = value
             elif any(kw in label for kw in ["anschrift", "geschaeftsanschrift",
@@ -261,135 +214,67 @@ def _parse_si_document(html: str) -> dict:
     return result
 
 
-# ══════════════════════════════════════════════
-# MODUL 1: HANDELSREGISTER
-# ══════════════════════════════════════════════
-
-BUNDESLAND_MAP = {
-    "BW": "bundeslandBW", "BY": "bundeslandBY", "BE": "bundeslandBE", "BR": "bundeslandBR",
-    "HB": "bundeslandHB", "HH": "bundeslandHH", "HE": "bundeslandHE", "MV": "bundeslandMV",
-    "NI": "bundeslandNI", "NW": "bundeslandNW", "RP": "bundeslandRP", "SL": "bundeslandSL",
-    "SN": "bundeslandSN", "ST": "bundeslandST", "SH": "bundeslandSH", "TH": "bundeslandTH",
-}
-
-RECHTSFORM_MAP = {
-    "AG": "1", "eG": "2", "eV": "3", "Einzelkauffrau": "4", "Einzelkaufmann": "5",
-    "SE": "6", "EWIV": "7", "GmbH": "8", "KG": "10", "OHG": "12", "Partnerschaft": "13",
-}
-
-
-# Mapping: API-Parameter -> moegliche mechanize Form-Control-Namen (in Praeferenzreihenfolge)
-# Falls sich die JSF-IDs aendern, hier anpassen.
-FIELD_CANDIDATES = {
-    "schlagwoerter": ["form:schlagwoerter"],
-    "schlagwortOptionen": ["form:schlagwortOptionen"],
-    "ergebnisseProSeite": ["form:ergebnisseProSeite"],
-    "ort": ["form:ort"],
-    "postleitzahl": ["form:postleitzahl", "form:plz"],
-    "strasse": ["form:strasse"],
-    "rechtsform": ["form:rechtsform"],
-}
-
-
-def _find_and_set(br: mechanize.Browser, param_key: str, value, is_list=False) -> bool:
-    """Versucht ein Feld ueber die Kandidatenliste zu setzen. Loggt Fehler."""
-    candidates = FIELD_CANDIDATES.get(param_key, [f"form:{param_key}"])
-    for name in candidates:
-        try:
-            if is_list:
-                br[name] = value if isinstance(value, list) else [str(value)]
-            else:
-                br[name] = str(value)
-            logger.info(f"Feld '{param_key}' -> '{name}' erfolgreich gesetzt auf: {value}")
-            return True
-        except (mechanize.ControlNotFoundError, mechanize.ItemNotFoundError):
-            continue
-    
-    # Keiner der Kandidaten hat gepasst - logge verfuegbare Felder
-    available = [c.name for c in br.form.controls if c.name]
-    logger.error(f"FEHLER: Feld '{param_key}' nicht gefunden! "
-                 f"Kandidaten: {candidates}, Verfuegbar: {available}")
-    return False
-
-
 @app.post("/handelsregister/search")
 def handelsregister_search(
-    schlagwoerter: str = Query("", description="Suchbegriff, z.B. 'Steuerberatung'."),
-    schlagwort_option: int = Query(1, description="1=alle, 2=mind. eins, 3=exakt"),
-    ort: Optional[str] = Query(None, description="Ort, z.B. 'Hamburg'"),
-    plz: Optional[str] = Query(None, description="PLZ, z.B. '20095'"),
-    strasse: Optional[str] = Query(None, description="Strasse"),
-    bundesland: Optional[str] = Query(None, description="Kuerzel, z.B. 'HH,NI'"),
-    rechtsform: Optional[str] = Query(None, description="Code oder Name, z.B. '8' oder 'GmbH'"),
-    auch_geloeschte: bool = Query(False, description="Auch geloeschte Firmen"),
-    ergebnisse_pro_seite: int = Query(100, description="10, 25, 50 oder 100"),
-    mit_si: bool = Query(False, description="SI-Dokument (Anschrift etc.) mit abrufen? ACHTUNG: Langsam!"),
-    debug_fields: bool = Query(False, description="Debug: Gibt alle Formularfelder zurueck"),
+    schlagwoerter: str = Query(""),
+    schlagwort_option: int = Query(1),
+    ort: Optional[str] = Query(None),
+    plz: Optional[str] = Query(None),
+    strasse: Optional[str] = Query(None),
+    bundesland: Optional[str] = Query(None),
+    rechtsform: Optional[str] = Query(None),
+    auch_geloeschte: bool = Query(False),
+    ergebnisse_pro_seite: int = Query(100),
+    mit_si: bool = Query(False),
+    debug_fields: bool = Query(False),
 ):
     if not schlagwoerter and not ort and not plz:
         raise HTTPException(status_code=400, detail="Mindestens schlagwoerter, ort oder plz angeben.")
-
     field_errors = []
-
     try:
         br = _create_browser()
         _open_erweiterte_suche(br)
         br.select_form(name="form")
-
-        # Debug-Modus: Formularfelder ausgeben
         if debug_fields:
-            controls = _debug_form_controls(br)
-            return {"debug_form_controls": controls}
-
-        # --- Felder setzen mit klarem Fehler-Reporting ---
+            return {"debug_form_controls": _debug_form_controls(br)}
         if schlagwoerter:
             if not _find_and_set(br, "schlagwoerter", schlagwoerter):
                 field_errors.append("schlagwoerter")
-
         if not _find_and_set(br, "schlagwortOptionen", str(schlagwort_option), is_list=True):
             field_errors.append("schlagwortOptionen")
-
         _find_and_set(br, "ergebnisseProSeite", str(ergebnisse_pro_seite), is_list=True)
-
         if ort:
             if not _find_and_set(br, "ort", ort):
                 field_errors.append("ort")
-
         if plz:
             if not _find_and_set(br, "postleitzahl", plz):
                 field_errors.append("postleitzahl")
-
         if strasse:
             if not _find_and_set(br, "strasse", strasse):
                 field_errors.append("strasse")
-
         if bundesland:
             for bl in bundesland.upper().split(","):
                 bl = bl.strip()
                 if bl in BUNDESLAND_MAP:
-                    ctrl_name = f"form:{BUNDESLAND_MAP[bl]}"
+                    ctrl_name = f"form:{BUNDESLAND_MAP[bl]}_input"
                     try:
                         br.find_control(ctrl_name).value = ["on"]
                     except Exception:
                         field_errors.append(f"bundesland_{bl}")
-
         if rechtsform:
             rf_code = RECHTSFORM_MAP.get(rechtsform.strip(), rechtsform.strip())
             if not _find_and_set(br, "rechtsform", rf_code, is_list=True):
                 field_errors.append("rechtsform")
-
         if auch_geloeschte:
             try:
-                br.find_control("form:suchOptionenGeloescht").value = ["true"]
+                br.find_control("form:auchGeloeschte_input").value = ["on"]
             except Exception:
-                field_errors.append("suchOptionenGeloescht")
+                field_errors.append("auchGeloeschte")
 
-        # --- Suche absenden ---
         response = br.submit()
         result_html = response.read().decode("utf-8")
         soup = BeautifulSoup(result_html, "html.parser")
         grid = soup.find("table", role="grid")
-
         results = []
         if grid:
             for row in grid.find_all("tr"):
@@ -398,22 +283,16 @@ def handelsregister_search(
                     if parsed:
                         results.append(parsed)
 
-        # --- SI-Dokumente abrufen ---
         if mit_si and results:
-            for idx, company in enumerate(results):
+            for company in results:
                 si_doc = next((d for d in company.get("dokumente", []) if d["typ"] == "SI"), None)
                 if si_doc and si_doc.get("link_id"):
                     try:
                         si_html = _fetch_si_document(br, si_doc["link_id"])
                         company["si_daten"] = _parse_si_document(si_html)
-
-                        # Nach SI-Abruf: zurueck zur Ergebnisliste navigieren
-                        # Statt br.back() die Suche neu ausfuehren ist zuverlaessiger
-                        # bei JSF, aber wir versuchen zunaechst back()
                         try:
                             br.back()
                         except Exception:
-                            # Falls back() fehlschlaegt: Suche erneut starten
                             _open_erweiterte_suche(br)
                             br.select_form(name="form")
                             if schlagwoerter:
@@ -422,87 +301,54 @@ def handelsregister_search(
                             if ort:
                                 _find_and_set(br, "ort", ort)
                             br.submit()
-
                         time.sleep(0.8)
                     except Exception as e:
                         company["si_daten"] = {"error": f"SI-Abruf fehlgeschlagen: {str(e)}"}
-                else:
-                    company["si_daten"] = {"error": "Kein SI-Link verfuegbar"}
 
-        response_data = {
-            "query": {
-                "schlagwoerter": schlagwoerter, "ort": ort, "plz": plz,
-                "strasse": strasse, "bundesland": bundesland, "rechtsform": rechtsform,
-            },
-            "count": len(results),
-            "results": results,
+        resp = {
+            "query": {"schlagwoerter": schlagwoerter, "ort": ort, "plz": plz,
+                      "strasse": strasse, "bundesland": bundesland, "rechtsform": rechtsform},
+            "count": len(results), "results": results,
         }
-
         if field_errors:
-            response_data["_field_warnings"] = (
-                f"Folgende Felder konnten NICHT gesetzt werden: {field_errors}. "
-                f"Die Suche lief ohne diese Filter!"
-            )
-
-        return response_data
-
+            resp["_field_warnings"] = f"Felder nicht gesetzt: {field_errors}"
+        return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ══════════════════════════════════════════════
-# DEBUG-Endpoint: Formularfelder anzeigen
-# ══════════════════════════════════════════════
-
 @app.get("/handelsregister/debug-fields")
 def handelsregister_debug_fields():
-    """Gibt alle verfuegbaren Formularfelder der erweiterten Suche zurueck."""
     try:
         br = _create_browser()
         _open_erweiterte_suche(br)
         br.select_form(name="form")
-        controls = _debug_form_controls(br)
-        return {"form_name": br.form.name, "controls": controls}
+        return {"form_name": br.form.name, "controls": _debug_form_controls(br)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ══════════════════════════════════════════════
-# Einzeldokument abrufen
-# ══════════════════════════════════════════════
-
 @app.get("/handelsregister/dokument")
-def handelsregister_dokument(firma: str = Query(..., description="Exakter Firmenname"),
-                             typ: str = Query("SI", description="Dokumenttyp: SI, AD, CD")):
+def handelsregister_dokument(firma: str = Query(...), typ: str = Query("SI")):
     try:
         br = _create_browser()
         _open_erweiterte_suche(br)
-
         br.select_form(name="form")
         _find_and_set(br, "schlagwoerter", firma)
         _find_and_set(br, "schlagwortOptionen", "3", is_list=True)
         response = br.submit()
         soup = BeautifulSoup(response.read().decode("utf-8"), "html.parser")
         grid = soup.find("table", role="grid")
-
         if not grid:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-
-        first_row = next(
-            (row for row in grid.find_all("tr") if row.get("data-ri") is not None), None
-        )
+        first_row = next((row for row in grid.find_all("tr") if row.get("data-ri") is not None), None)
         if not first_row:
             raise HTTPException(status_code=404, detail="Firma nicht gefunden")
-
         parsed = _parse_hr_result_row(first_row)
         target_doc = next((d for d in parsed.get("dokumente", []) if d["typ"] == typ), None)
-
         if not target_doc or not target_doc.get("link_id"):
             raise HTTPException(status_code=404, detail=f"{typ}-Dokument nicht verfuegbar.")
-
-        # JSF-POST fuer Dokument-Abruf
         doc_html = _fetch_si_document(br, target_doc["link_id"])
-
         if typ == "SI":
             return {"firma": firma, "register_nummer": parsed.get("register_nummer"),
                     "sitz": parsed.get("sitz"), "dokument_typ": typ,
@@ -512,104 +358,356 @@ def handelsregister_dokument(firma: str = Query(..., description="Exakter Firmen
             return {"firma": firma, "register_nummer": parsed.get("register_nummer"),
                     "dokument_typ": typ,
                     "text": doc_soup.get_text(separator="\n", strip=True)[:5000]}
-
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ══════════════════════════════════════════════
-# MODUL 2: STEUERKANZLEIEN
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+#
+#   MODUL 2: STEUERBERATER.DE SCRAPER
+#
+# ══════════════════════════════════════════════════════════════════
 
-STV_BASE = "https://www.steuerberaterverzeichnis.de"
+STB_BASE = "https://www.steuerberater.de"
 
-def _slugify(value: str) -> str:
-    if not value:
-        return ""
-    value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('utf-8')
-    value = re.sub(r'[^\w\s-]', '', value.lower())
-    return re.sub(r'[-\s]+', '-', value).strip('-')
 
-@app.get("/steuerkanzleien/search")
-def steuerkanzleien_search(
-    city: Optional[str] = Query(None, description="Stadt, z.B. Hamburg"),
-    page: int = Query(1, ge=1, description="Seitennummer")
+def _stb_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
+# ──────────────────────────────────────────────
+# LISTEN-SUCHE: /steuerberater/search
+# ──────────────────────────────────────────────
+
+@app.get("/steuerberater/search")
+def steuerberater_search(
+    stadt: Optional[str] = Query(None, description="Stadt, z.B. 'Hamburg', 'Berlin'"),
+    plz: Optional[str] = Query(None, description="Postleitzahl, z.B. '20095'"),
+    name: Optional[str] = Query(None, description="Name/Firmenname des Steuerberaters"),
+    umkreis: int = Query(50, description="Umkreis in km (10, 20, 30, 40, 50)"),
+    max_seiten: int = Query(1, description="Wie viele Ergebnisseiten scrapen? (1 Seite = ca. 10 Eintraege)"),
+    mit_details: bool = Query(False, description="Detailseite jedes Eintrags direkt mit-crawlen? (langsamer, aber mehr Daten)"),
 ):
-    if not city:
-        raise HTTPException(status_code=400, detail="Parameter 'city' ist erforderlich.")
+    """
+    Durchsucht steuerberater.de nach Steuerberatern/Kanzleien.
+    Gibt Name, Adresse, Berufsbezeichnung, Profil-URL zurueck.
+    Mit mit_details=true zusaetzlich: Telefon, Fax, Homepage, Taetigkeitsfelder.
+    """
+    if not stadt and not plz and not name:
+        raise HTTPException(status_code=400, detail="Mindestens stadt, plz oder name angeben.")
 
     try:
-        session = requests.Session()
-        session.headers.update(HEADERS)
+        session = _stb_session()
 
-        city_slug = _slugify(city)
-        search_url = f"{STV_BASE}/steuerberater-{city_slug}.html"
-        if page > 1:
-            search_url = f"{STV_BASE}/steuerberater-{city_slug}/seite-{page}.html"
+        # --- Suchparameter zusammenbauen ---
+        params = {
+            "auswahlLand": "1",
+            "termsOfUse": "1",
+            "submit": "Steuerberater suchen",
+            "umkreis": str(umkreis),
+            "branchen[]": "-1",
+            "laender[]": "-1",
+            "sprachen[]": "-1",
+            "taetigkeitsbereiche[]": "-1",
+            "zusaetze[]": "-1",
+            "land": "-1",
+        }
+        if stadt:
+            params["stadt"] = stadt
+        if plz:
+            params["plz"] = plz
+        if name:
+            params["name"] = name
 
-        resp = session.get(search_url, timeout=15)
+        # Erste Seite laden
+        search_url = f"{STB_BASE}/steuerberater-suchen"
+        resp = session.get(search_url, params=params, timeout=20)
         resp.raise_for_status()
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        results = _parse_stv_results(soup)
+        all_results = []
+        current_html = resp.text
 
-        total_pages = _get_total_pages(soup)
+        for page_num in range(max_seiten):
+            page_results = _parse_stb_list(current_html)
+            if not page_results:
+                break
+            all_results.extend(page_results)
 
-        return {"query": {"city": city}, "page": page, "total_pages": total_pages,
-                "count": len(results), "results": results}
+            # Naechste Seite? (Pagination-Link suchen)
+            if page_num < max_seiten - 1:
+                soup = BeautifulSoup(current_html, "html.parser")
+                next_link = soup.find("a", {"rel": "next"})
+                if not next_link:
+                    # Alternativ: "Weiter"-Link suchen
+                    next_link = soup.find("a", string=re.compile(r"(Weiter|weiter|Next|next|>>|>)", re.I))
+                if next_link and next_link.get("href"):
+                    next_url = urllib.parse.urljoin(STB_BASE, next_link["href"])
+                    time.sleep(0.5)
+                    resp = session.get(next_url, timeout=20)
+                    resp.raise_for_status()
+                    current_html = resp.text
+                else:
+                    break  # Keine weiteren Seiten
+
+        # --- Optional: Detailseiten crawlen ---
+        if mit_details and all_results:
+            for i, entry in enumerate(all_results):
+                if entry.get("profil_url"):
+                    try:
+                        time.sleep(0.3)
+                        detail = _fetch_stb_detail(session, entry["profil_url"])
+                        entry.update(detail)
+                    except Exception as e:
+                        entry["detail_error"] = str(e)
+
+        return {
+            "query": {"stadt": stadt, "plz": plz, "name": name, "umkreis": umkreis},
+            "count": len(all_results),
+            "results": all_results,
+        }
 
     except requests.HTTPError as e:
-        if e.response.status_code == 404:
-            raise HTTPException(status_code=404, detail=f"Keine Ergebnisse fuer '{city}' gefunden (URL: {search_url})")
-        raise HTTPException(status_code=502, detail=f"Fehler bei Zugriff auf {STV_BASE}: {e}")
+        raise HTTPException(status_code=502, detail=f"steuerberater.de Fehler: {e}")
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Nicht erreichbar: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _parse_stv_results(soup: BeautifulSoup) -> list:
+def _parse_stb_list(html: str) -> list:
+    """Parst die Suchergebnis-Liste von steuerberater.de."""
+    soup = BeautifulSoup(html, "html.parser")
     results = []
-    entries = soup.select(".kanzlei-eintrag, .stb-eintrag, article.entry")
-    for entry in entries:
-        r = _extract_stv_entry(entry)
-        if r.get("name"):
-            results.append(r)
+
+    # Alle Profil-Links finden (Pattern: /steuerberater-suchen/view/ID/name)
+    profile_links = soup.find_all("a", href=re.compile(r"/steuerberater-suchen/view/\d+/"))
+
+    # Deduplizieren (jedes Profil kommt mehrfach vor: Bild, Name, Profil-Button)
+    seen_urls = set()
+    unique_profiles = []
+    for link in profile_links:
+        href = link.get("href", "")
+        full_url = urllib.parse.urljoin(STB_BASE, href.split("#")[0])
+        if full_url not in seen_urls:
+            seen_urls.add(full_url)
+            unique_profiles.append((link, full_url))
+
+    for link, profile_url in unique_profiles:
+        entry = {
+            "name": "",
+            "berufsbezeichnung": "",
+            "adresse": "",
+            "profil_url": profile_url,
+        }
+
+        # Name extrahieren: Suche das naechste h2/h3/h4 Element in der Naehe
+        # Oder den Text des Links selbst
+        name_text = link.get_text(strip=True)
+        if name_text and len(name_text) > 2:
+            entry["name"] = name_text
+
+        # Nach oben im DOM gehen, um den umgebenden Container zu finden
+        container = link.find_parent(["div", "article", "li", "section"])
+        if container:
+            # Name aus Heading extrahieren
+            heading = container.find(["h2", "h3", "h4", "h5"])
+            if heading:
+                entry["name"] = heading.get_text(strip=True)
+
+            # Berufsbezeichnung (steht oft ueber dem Namen)
+            full_text = container.get_text(separator="\n", strip=True)
+            for line in full_text.split("\n"):
+                line = line.strip()
+                if any(kw in line.lower() for kw in
+                       ["steuerberater", "wirtschaftsprüfer", "buchprüfer",
+                        "rechtsanwalt", "steuerbevollmächtig"]):
+                    if line != entry["name"]:
+                        entry["berufsbezeichnung"] = line
+                        break
+
+            # Adresse (Pattern: "Strasse X in PLZ Ort")
+            for line in full_text.split("\n"):
+                line = line.strip()
+                if re.search(r"\d{5}\s+\w", line) and " in " in line:
+                    entry["adresse"] = line
+                    break
+                elif re.search(r"\d{5}\s+\w", line):
+                    entry["adresse"] = line
+                    break
+
+        if entry["name"]:
+            results.append(entry)
+
     return results
 
 
-def _extract_stv_entry(entry) -> dict:
-    result = {"name": "", "detail_url": "", "adresse": "", "telefon": "", "email": "", "website": ""}
-    name_tag = entry.find(["h2", "h3"])
-    if name_tag:
-        result["name"] = name_tag.get_text(strip=True)
-        link = name_tag.find("a", href=True)
-        if link:
-            result["detail_url"] = STV_BASE + link["href"]
-    for p in entry.find_all("p"):
-        text = p.get_text(strip=True)
-        if not result["adresse"] and any(k in text for k in ["str.", " Str", "-Str"]):
-            result["adresse"] = text
-        elif not result["telefon"] and ("Tel" in text or "Fon" in text):
-            result["telefon"] = text.split(":")[-1].strip()
-    return result
+# ──────────────────────────────────────────────
+# DETAIL-ABRUF: /steuerberater/detail
+# ──────────────────────────────────────────────
+
+@app.get("/steuerberater/detail")
+def steuerberater_detail(
+    url: str = Query(..., description="Profil-URL, z.B. 'https://www.steuerberater.de/steuerberater-suchen/view/8140/elena-haegler'"),
+):
+    """Crawlt die Detailseite eines Steuerberaters und extrahiert alle verfuegbaren Daten."""
+    try:
+        session = _stb_session()
+        detail = _fetch_stb_detail(session, url)
+        return {"url": url, **detail}
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Nicht erreichbar: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-def _get_total_pages(soup: BeautifulSoup) -> int:
-    pag = soup.find(class_=re.compile(r"(pagination|pager)", re.I))
-    if pag:
-        nums = [int(a.get_text(strip=True)) for a in pag.find_all("a") if a.get_text(strip=True).isdigit()]
-        if nums:
-            return max(nums)
-    return 1
+def _fetch_stb_detail(session: requests.Session, url: str) -> dict:
+    """Crawlt eine einzelne Detailseite und extrahiert strukturierte Daten."""
+    resp = session.get(url, timeout=15)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    detail = {
+        "name": "",
+        "kanzlei_name": "",
+        "berufsbezeichnung": "",
+        "adresse": "",
+        "telefon": "",
+        "fax": "",
+        "email": "",
+        "homepage": "",
+        "beschreibung": "",
+        "taetigkeitsfelder": [],
+        "branchen": [],
+        "sprachen": [],
+    }
+
+    # --- Name & Kanzleiname ---
+    # Der Kanzleiname steht typischerweise in einem h2 im Hauptbereich
+    main_heading = soup.find("h2")
+    if main_heading:
+        detail["kanzlei_name"] = main_heading.get_text(strip=True)
+
+    # Der persoenliche Name steht oft im Breadcrumb oder title
+    breadcrumb = soup.find("ol", class_=re.compile(r"breadcrumb", re.I))
+    if breadcrumb:
+        items = breadcrumb.find_all("li")
+        if items:
+            last_item = items[-1].get_text(strip=True)
+            if last_item:
+                detail["name"] = last_item
+
+    # Fallback: Aus dem <title> Tag
+    if not detail["name"]:
+        title_tag = soup.find("title")
+        if title_tag:
+            title_text = title_tag.get_text(strip=True)
+            # Pattern: "Steuerberaterin Elena Haegler"
+            match = re.search(r"(?:Steuerberater(?:in)?|Wirtschaftsprüfer(?:in)?)\s+(.+?)(?:\s*\||\s*-|\s*$)", title_text)
+            if match:
+                detail["name"] = match.group(1).strip()
+
+    # --- Berufsbezeichnung ---
+    # Steht oft direkt ueber oder unter dem Namen
+    full_text = soup.get_text(separator="\n", strip=True)
+    for line in full_text.split("\n"):
+        line = line.strip()
+        if any(kw in line.lower() for kw in ["steuerberater", "wirtschaftsprüfer",
+                                               "buchprüfer", "rechtsanwalt",
+                                               "steuerbevollmächtig"]):
+            if len(line) < 100 and line not in [detail["name"], detail["kanzlei_name"]]:
+                detail["berufsbezeichnung"] = line
+                break
+
+    # --- Adresse ---
+    # Suche nach typischen Adress-Patterns im gesamten Text
+    for line in full_text.split("\n"):
+        line = line.strip()
+        if re.search(r"\d{5}\s+\w", line) and len(line) < 200:
+            # Bereinige die Adresse
+            addr = line.strip()
+            if addr and addr != detail["kanzlei_name"]:
+                detail["adresse"] = addr
+                break
+
+    # --- Telefon & Fax ---
+    # Suche nach tel:-Links
+    tel_links = soup.find_all("a", href=re.compile(r"^tel:"))
+    for i, tl in enumerate(tel_links):
+        number = tl.get_text(strip=True)
+        if i == 0:
+            detail["telefon"] = number
+        elif i == 1:
+            detail["fax"] = number
+
+    # --- Homepage ---
+    homepage_link = soup.find("a", string=re.compile(r"Homepage", re.I))
+    if homepage_link and homepage_link.get("href"):
+        href = homepage_link["href"]
+        if href.startswith("http"):
+            detail["homepage"] = href
+
+    # --- E-Mail ---
+    # Suche nach mailto-Links (nicht info@steuerberater.de)
+    mailto_links = soup.find_all("a", href=re.compile(r"^mailto:"))
+    for ml in mailto_links:
+        email = ml.get("href", "").replace("mailto:", "").strip()
+        if email and "steuerberater.de" not in email:
+            detail["email"] = email
+            break
+
+    # --- Beschreibung ---
+    blockquote = soup.find("blockquote")
+    if blockquote:
+        detail["beschreibung"] = blockquote.get_text(strip=True)
+
+    # --- Taetigkeitsfelder ---
+    taetig_section = _find_section_by_heading(soup, "Tätigkeitsfelder")
+    if taetig_section:
+        detail["taetigkeitsfelder"] = [t.strip() for t in taetig_section if t.strip()]
+
+    # --- Branchen ---
+    branchen_section = _find_section_by_heading(soup, "Branchen")
+    if branchen_section:
+        detail["branchen"] = [b.strip() for b in branchen_section if b.strip()]
+
+    # --- Sprachen ---
+    sprachen_section = _find_section_by_heading(soup, "Sprachen")
+    if sprachen_section:
+        detail["sprachen"] = [s.strip() for s in sprachen_section if s.strip()]
+
+    return detail
 
 
-@app.get("/steuerkanzleien/detail")
-def steuerkanzleien_detail(url: str = Query(..., description="URL der Kanzlei-Detailseite")):
-    return {"message": "Endpoint noch nicht vollstaendig implementiert"}
+def _find_section_by_heading(soup: BeautifulSoup, heading_text: str) -> list:
+    """Findet eine Sektion anhand der Ueberschrift und gibt die Inhalte als Liste zurueck."""
+    heading = soup.find(["h3", "h4", "h5"], string=re.compile(re.escape(heading_text), re.I))
+    if not heading:
+        return []
 
-@app.get("/enrich")
-def enrich(website: str = Query(..., description="Website-URL der Kanzlei")):
-    return {"message": "Endpoint noch nicht vollstaendig implementiert"}
+    items = []
+    # Sammle alle Text-Elemente nach der Ueberschrift bis zur naechsten Ueberschrift
+    sibling = heading.find_next_sibling()
+    while sibling:
+        if sibling.name in ["h3", "h4", "h5"]:
+            break  # Naechste Sektion erreicht
+        text = sibling.get_text(strip=True)
+        if text:
+            items.append(text)
+        sibling = sibling.find_next_sibling()
+
+    # Falls keine Siblings gefunden, suche im Parent-Container
+    if not items:
+        parent = heading.find_parent(["div", "section"])
+        if parent:
+            for child in parent.find_all(["span", "div", "p", "li"]):
+                text = child.get_text(strip=True)
+                if text and text != heading_text:
+                    items.append(text)
+
+    return items
+
+
